@@ -1,0 +1,171 @@
+import cv2
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+from PIL import Image
+import numpy as np
+import requests
+from geopy.geocoders import Nominatim
+
+# Image size and batch size
+img_height, img_width = 224, 224
+batch_size = 32
+
+# Load datasets
+train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    'D:\\Sai\\projectes\\tensorflow\\train',
+    image_size=(img_height, img_width),
+    batch_size=batch_size
+)
+
+val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    'D:\\Sai\\projectes\\tensorflow\\valid',
+    image_size=(img_height, img_width),
+    batch_size=batch_size
+)
+
+test_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    'D:\\Sai\\projectes\\tensorflow\\test',
+    image_size=(img_height, img_width),
+    batch_size=batch_size
+)
+
+# Use MobileNetV2 for transfer learning
+base_model = tf.keras.applications.MobileNetV2(input_shape=(img_height, img_width, 3),
+                                               include_top=False,
+                                               weights='imagenet')
+base_model.trainable = False
+
+# Define the model
+model = models.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dense(512, activation='relu'),
+    layers.Dropout(0.5),
+    layers.Dense(len(train_ds.class_names), activation='softmax')
+])
+
+# Compile the model
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Train the model
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=15
+)
+
+# Evaluate the model
+test_loss, test_acc = model.evaluate(test_ds)
+print(f'Test accuracy: {test_acc}')
+
+# Initialize Firebase
+def initialize_firebase():
+    cred = credentials.Certificate(r"D:\Sai\projectes\tensorflow\credits.json")
+    firebase_admin.initialize_app(cred, {
+        'storageBucket': 'project-1-e945e.appspot.com',
+        'databaseURL': 'https://project-1-e945e-default-rtdb.firebaseio.com/'
+    })
+
+# Predict disease from the image
+def predict_disease(img_array):
+    img_array = tf.expand_dims(img_array, 0)
+    predictions = model.predict(img_array)
+    class_names = train_ds.class_names
+    predicted_class = class_names[tf.argmax(predictions[0])]
+    return predicted_class
+
+# Capture image from the webcam
+def capture_image():
+    cap = cv2.VideoCapture(0)  # 0 is usually the default camera
+    if not cap.isOpened():
+        print("Cannot open camera")
+        return None
+
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to capture image")
+        cap.release()
+        return None
+
+    img = cv2.resize(frame, (img_height, img_width))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    cap.release()
+
+    return img
+
+# Get detailed location using geopy
+def get_location():
+    try:
+        # Fetch location data from ipinfo.io
+        response = requests.get("https://ipinfo.io")
+        data = response.json()
+        loc = data['loc'].split(',')
+        latitude = loc[0]
+        longitude = loc[1]
+
+        # Use geopy to get a detailed address
+        geolocator = Nominatim(user_agent="geoapiExercises")
+        location = geolocator.reverse(f"{latitude}, {longitude}", exactly_one=False)
+        if location:
+            return {
+                'latitude': latitude,
+                'longitude': longitude,
+            }
+        else:
+            return {
+                'latitude': latitude,
+                'longitude': longitude,
+            }
+    except Exception as e:
+        print(f"Error fetching location: {e}")
+        return {
+            'latitude': "Unknown",
+            'longitude': "Unknown",
+        }
+
+# Upload image to Firebase Storage
+def upload_image_to_storage(image_path):
+    bucket = storage.bucket()
+    blob = bucket.blob(f'images/{image_path.split("/")[-1]}')
+    blob.upload_from_filename(image_path)
+    blob.make_public()
+    return blob.public_url
+
+# Save image URL and location to Firebase Realtime Database
+def save_url_to_realtime_db(download_url, location):
+    db = firestore.client()
+    ref = db.collection('images')
+    ref.add({
+        'image_url': download_url,
+        'latitude': location['latitude'],
+        'longitude': location['longitude'],
+    })
+
+# Main function to execute the process
+def main():
+    initialize_firebase()
+
+    img_array = capture_image()
+    if img_array is not None:
+        predicted_class = predict_disease(img_array)
+        print(f"Predicted Class: {predicted_class}")
+
+        img = Image.fromarray(img_array)
+        image_path = 'captured_image.jpg'
+        img.save(image_path)
+
+        download_url = upload_image_to_storage(image_path)
+        location = get_location()
+        save_url_to_realtime_db(download_url, location)
+
+        print(f"File uploaded and URL saved to Realtime Database: {download_url}")
+        print(f"Location: {location}")
+    else:
+        print("No image captured")
+
+if __name__ == "__main__":
+    main()
